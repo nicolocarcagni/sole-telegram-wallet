@@ -10,10 +10,11 @@ from io import BytesIO
 from decimal import Decimal
 from decimal import Decimal
 from datetime import datetime
+import time
 
 # Image Processing
 from PIL import Image
-from pyzbar.pyzbar import decode as qr_decode
+from pyzbar.pyzbar import decode as qr_decode, ZBarSymbol
 
 # Environment & Crypto
 from dotenv import load_dotenv
@@ -134,7 +135,7 @@ def is_valid_address(address):
         return False
 
 # --- SERIALIZATION ---
-def serialize_for_hash(inputs, outputs):
+def serialize_for_hash(inputs, outputs, timestamp):
     buffer = bytearray()
     for vin in inputs:
         buffer += bytes.fromhex(vin['txid'])
@@ -149,9 +150,11 @@ def serialize_for_hash(inputs, outputs):
         buffer += struct.pack(">q", vout['value'])
         pkh = vout['pubkeyhash']
         buffer += pkh
+    # Timestamp (int64, Big Endian)
+    buffer += struct.pack(">q", timestamp)
     return buffer
 
-def serialize_for_api(inputs, outputs):
+def serialize_for_api(inputs, outputs, timestamp):
     buffer = bytearray()
     buffer += struct.pack(">q", len(inputs))
     for vin in inputs:
@@ -167,6 +170,8 @@ def serialize_for_api(inputs, outputs):
         buffer += struct.pack(">q", vout['value'])
         pkh = vout['pubkeyhash']
         buffer += struct.pack(">q", len(pkh)); buffer += pkh
+    # Timestamp (int64, Big Endian)
+    buffer += struct.pack(">q", timestamp)
     return buffer
 
 # --- SECURE WALLET CLASS ---
@@ -229,6 +234,157 @@ def get_wallet(user_id):
 
 # --- BOT HANDLERS ---
 
+
+# --- HISTORY ---
+def get_history(address):
+    try:
+        r = requests.get(f"{NODE_URL}/transactions/{address}", timeout=5)
+        if r.status_code != 200: return []
+        data = r.json()
+        # Sort by timestamp desc
+        data.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+        
+        parsed = []
+        for tx in data:
+            # Inputs/Outputs
+            inputs = tx.get('inputs', [])
+            outputs = tx.get('outputs', [])
+            
+            # 1. Determine Direction
+            is_sent = False
+            first_sender = inputs[0].get('sender', 'Unknown') if inputs else 'Unknown'
+            
+            if first_sender == address:
+                is_sent = True
+            
+            # 2. Determine Amount & Display Address
+            amount_val = Decimal(0)
+            other_addr = "?"
+            
+            if is_sent:
+                # Standard logic: Sum of everything NOT going back to me.
+                recipients = []
+                for o in outputs:
+                    if o.get('receiver') != address:
+                        amount_val += Decimal(o.get('value', 0))
+                        recipients.append(o.get('receiver', '?'))
+                
+                # If multiple recipients, show the first one or "Multiple"
+                if recipients:
+                    other_addr = recipients[0]
+                else:
+                    # Special case: Self-send or Change-only? Show myself.
+                    other_addr = address
+            else:
+                # IN: Sum of outputs where receiver == address
+                for o in outputs:
+                    if o.get('receiver') == address:
+                        amount_val += Decimal(o.get('value', 0))
+                # From: Sender
+                other_addr = first_sender
+
+            # 3. Format Date
+            ts = tx.get('timestamp', 0)
+            date_str = "Genesis"
+            if ts > 0:
+                dt = datetime.fromtimestamp(ts)
+                date_str = dt.strftime('%Y-%m-%d %H:%M')
+            
+            parsed.append({
+                'direction': 'OUT' if is_sent else 'IN',
+                'amount': amount_val / Decimal(COIN),
+                'other': other_addr,
+                'date': date_str
+            })
+            
+        return parsed
+    except Exception as e:
+        logger.error(f"History parse error: {e}")
+        return []
+
+async def history_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    # Parse page
+    page = 0
+    try:
+        parts = query.data.split('_')
+        if len(parts) > 2:
+           page = int(parts[-1])
+    except: pass
+    
+    user_id = update.effective_user.id
+    db = load_db()
+    if str(user_id) not in db: return
+    addr = db[str(user_id)]['address']
+    
+    history = get_history(addr)
+    
+    if not history:
+        # Use send_new_screen to ensure clean state if history is empty
+        await send_new_screen(
+             update, context, 
+             text="📜 <b>Transaction History</b>\n\nNo transactions found.", 
+             keyboard=[[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+        )
+        return
+
+    # Pagination
+    ITEMS_PER_PAGE = 5
+    total_pages = (len(history) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+    # Clamp page
+    if page < 0: page = 0
+    if page >= total_pages: page = total_pages - 1
+    
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    page_items = history[start_idx:end_idx]
+    
+    msg_lines = [f"📜 <b>Transaction History</b> (Page {page+1}/{total_pages})\n"]
+    
+    for item in page_items:
+        icon = "🔴" if item['direction'] == 'OUT' else "🟢"
+        sign = "-" if item['direction'] == 'OUT' else "+"
+        prepos = "to" if item['direction'] == 'OUT' else "from"
+        
+        # FULL ADDRESS in code block, new line for redability
+        msg_lines.append(
+            f"{icon} <b>{sign}{item['amount']:.2f} SOLE</b> | {prepos}:\n"
+            f"<code>{item['other']}</code>\n"
+            f"📅 {item['date']}\n"
+        )
+        
+    text = "\n".join(msg_lines)
+    
+    # Nav Buttons
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f'tx_page_{page-1}'))
+    
+    nav_row.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data=f'noop'))
+    
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f'tx_page_{page+1}'))
+        
+    keyboard = [
+        nav_row,
+        [InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]
+    ]
+    
+    # Try to edit the message to avoid spam
+    try:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=query.message.message_id,
+            text=text,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        # Fallback: Send new screen
+        await send_new_screen(update, context, text, keyboard=keyboard)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if auth_user(user_id):
@@ -277,7 +433,8 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("💰 Refresh Balance", callback_data='refresh')],
-        [InlineKeyboardButton("📥 Receive", callback_data='receive'), InlineKeyboardButton("📤 Send", callback_data='send_start')]
+        [InlineKeyboardButton("📥 Receive", callback_data='receive'), InlineKeyboardButton("📤 Send", callback_data='send_start')],
+        [InlineKeyboardButton("📜 History", callback_data='tx_page_0')]
     ]
     
     # Use clean chat protocol
@@ -336,15 +493,22 @@ async def ask_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # CASE A: Photo (QR Code)
     if update.message.photo:
         try:
-            # Download photo
+            # Download photo (highest resolution)
             photo_file = await update.message.photo[-1].get_file()
             img_bytes = await photo_file.download_as_bytearray()
             
             # Decode using PIL and pyzbar
-            img = Image.open(BytesIO(img_bytes))
-            decoded_objects = qr_decode(img)
+            img = Image.open(BytesIO(img_bytes)).convert('L')
+            
+            # Resize if too big (Simulate max 1000px dimension)
+            if img.width > 1000 or img.height > 1000:
+                img.thumbnail((1000, 1000))
+            
+            # CRITICAL: Restrict to QRCODE only to prevent PDF417 crash
+            decoded_objects = qr_decode(img, symbols=[ZBarSymbol.QRCODE])
             
             if not decoded_objects:
+               logger.info(f"QR Decode failed on image size: {img.size}")
                await send_new_screen(
                     update, context,
                     text="⚠️ <b>No QR Code Found</b>\n\nThe image does not appear to contain a readable QR code. Try again or type the address:",
@@ -480,6 +644,7 @@ async def confirm_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # 4. Sign
     try:
+        current_time = int(time.time())
         for i, vin in enumerate(inputs):
             sign_inputs = []
             for j, v in enumerate(inputs):
@@ -491,12 +656,12 @@ async def confirm_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     row['pubkey'] = b''
                 sign_inputs.append(row)
-            blob = serialize_for_hash(sign_inputs, outputs)
+            blob = serialize_for_hash(sign_inputs, outputs, current_time)
             tx_hash = hashlib.sha256(blob).digest()
             vin['signature'] = w.sign(tx_hash)
             
         # 5. Broadcast
-        final_hex = serialize_for_api(inputs, outputs).hex()
+        final_hex = serialize_for_api(inputs, outputs, current_time).hex()
         r = requests.post(f"{NODE_URL}/tx/send", json={"hex": final_hex})
         
         if r.status_code == 200:
@@ -528,6 +693,8 @@ def main():
     app.add_handler(CallbackQueryHandler(refresh_cb, pattern='^refresh$'))
     app.add_handler(CallbackQueryHandler(receive_cb, pattern='^receive$'))
     app.add_handler(CallbackQueryHandler(back_dashboard_cb, pattern='^back_dashboard$'))
+    app.add_handler(CallbackQueryHandler(history_cb, pattern='^tx_page_'))
+    app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern='^noop$'))
     
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(send_start, pattern='^send_start$')],
