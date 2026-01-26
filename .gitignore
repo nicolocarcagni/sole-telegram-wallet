@@ -26,9 +26,7 @@ venv/
 .env
 
 # Wallet Data (CRITICAL: Do not commit keys)
-wallets/
-wallet.json
-wallet_enc.json
+*.json
 
 # Config
 config.json
