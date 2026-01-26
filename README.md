@@ -6,21 +6,11 @@
 ![Status](https://img.shields.io/badge/Status-Stable-success)
 
 ## About
-**SOLE Telegram Wallet** is a secure, high-speed custodial interface for interacting with the **SOLE Blockchain**. Designed for simplicity and performance, it allows users to manage funds, execute transactions, and monitor their history directly from their favorite messaging app. Whether you're a developer or a crypto enthusiast, this bot puts the power of the SOLE network in your pocket.
+**SOLE Telegram Wallet** is a custodial interface for the **SOLE Blockchain**, developed as a proof-of-concept for a university thesis project.
 
-## Key Features
+Designed to demonstrate practical blockchain integration, it allows users to manage test funds, execute transactions, and monitor history via a Telegram bot. This project is strictly for **educational and research purposes**.
 
-*   **🔐 Security First**
-    Private keys are encrypted **at-rest** using **AES-256** encryption with a `BOT_SECRET_KEY`. No sensitive data is ever stored in plain text, ensuring maximum security for user funds.
-
-*   **📸 Computer Vision Integration**
-    Native support for **QR Code scanning**. Simply send a photo of a QR code, and the bot intelligently extracts the wallet address using `zbar` technology, streamlining the transaction process.
-
-*   **✨ Clean UI Protocol**
-    A polished interactions model that actively manages chat history. Old messages and menus are automatically cleaned up to prevent spam, keeping the interface focused and clutter-free.
-
-*   **📜 Smart History**
-    Real-time transaction tracking with visual indicators. Incoming (🟢) and outgoing (🔴) transactions are automatically parsed and presented in a clear, readable format.
+> **Disclaimer:** This is an independent student project and is **NOT** officially affiliated with or endorsed by the University of Salento (Unisalento).
 
 ## Prerequisites
 
@@ -109,7 +99,7 @@ From there, you can:
 The SOLE Telegram Wallet operates as a lightweight client bridging the gap between Telegram users and the **SOLE Blockchain Core**.
 
 *   **Backend:** Written in Python using `asyncio` for high-concurrency handling.
-*   **network:** Communicates via HTTP REST API with the [SOLE Core Node](https://github.com/nicolocarcagni/sole).
+*   **network:** Communicates via HTTP REST API with the [SOLE Core](https://github.com/nicolocarcagni/sole).
 *   **Encryption:** Uses `cryptography` library for client-side AES encryption handling.
 
 ---
