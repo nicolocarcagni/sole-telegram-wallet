@@ -1,0 +1,7 @@
+python-telegram-bot
+python-dotenv
+requests
+ecdsa
+cryptography
+qrcode[pil]
+pyzbar
