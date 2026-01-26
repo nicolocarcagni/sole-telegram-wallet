@@ -28,9 +28,6 @@ venv/
 # Wallet Data (CRITICAL: Do not commit keys)
 *.json
 
-# Config
-config.json
-
 # IDE
 .vscode/
 .idea/
