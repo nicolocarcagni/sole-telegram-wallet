@@ -497,18 +497,36 @@ async def ask_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo_file = await update.message.photo[-1].get_file()
             img_bytes = await photo_file.download_as_bytearray()
             
-            # Decode using PIL and pyzbar
-            img = Image.open(BytesIO(img_bytes)).convert('L')
+            # Base Image
+            original_img = Image.open(BytesIO(img_bytes))
+            decoded_objects = []
             
-            # Resize if too big (Simulate max 1000px dimension)
-            if img.width > 1000 or img.height > 1000:
-                img.thumbnail((1000, 1000))
+            # ATTEMPT 1: High Quality (Original)
+            # Try to decode without modification to preserve details
+            try:
+                decoded_objects = qr_decode(original_img, symbols=[ZBarSymbol.QRCODE])
+            except: pass
             
-            # CRITICAL: Restrict to QRCODE only to prevent PDF417 crash
-            decoded_objects = qr_decode(img, symbols=[ZBarSymbol.QRCODE])
-            
+            # ATTEMPT 2: Grayscale (Convert 'L')
+            # If failed, convert to grayscale (helps with contrast/artifacts)
             if not decoded_objects:
-               logger.info(f"QR Decode failed on image size: {img.size}")
+                try:
+                    gray_img = original_img.convert('L')
+                    decoded_objects = qr_decode(gray_img, symbols=[ZBarSymbol.QRCODE])
+                except: pass
+                
+            # ATTEMPT 3: Downscale (Resize)
+            # Only if huge > 2000px, resize to remove noise
+            if not decoded_objects and (original_img.width > 2000 or original_img.height > 2000):
+                try:
+                    resized_img = original_img.copy()
+                    resized_img.thumbnail((1024, 1024))
+                    # Try on resized (maybe add grayscale here too? Let's just resize original)
+                    decoded_objects = qr_decode(resized_img, symbols=[ZBarSymbol.QRCODE])
+                except: pass
+
+            if not decoded_objects:
+               logger.info(f"QR Decode failed after 3 attempts. Size: {original_img.size}")
                await send_new_screen(
                     update, context,
                     text="⚠️ <b>No QR Code Found</b>\n\nThe image does not appear to contain a readable QR code. Try again or type the address:",
