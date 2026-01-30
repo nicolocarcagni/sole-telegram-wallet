@@ -234,6 +234,42 @@ def get_wallet(user_id):
 
 # --- BOT HANDLERS ---
 
+# --- INFO ---
+async def info_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    
+    # Defaults
+    height = "Unknown"
+    peers = 0
+    version = "v2.0 (Sole Core)"
+    
+    # 1. Get Tip
+    try:
+        r = requests.get(f"{NODE_URL}/blocks/tip", timeout=2)
+        if r.status_code == 200:
+            d = r.json()
+            height = d.get('height', 'Unknown')
+    except: pass
+    
+    # 2. Get Peers
+    try:
+        r = requests.get(f"{NODE_URL}/network/peers", timeout=2)
+        if r.status_code == 200:
+            d = r.json()
+            peers = d.get('total_peers', 0)
+    except: pass
+    
+    text = (
+        f"ℹ️ <b>Network Info</b>\n\n"
+        f"📏 <b>Block Height:</b> {height}\n"
+        f"🔗 <b>Peers Connected:</b> {peers}\n"
+        f"🛠 <b>Node Version:</b> {version}\n\n"
+        f"<i>Sole Blockchain is live since Jan 2026.</i>"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+    await send_new_screen(update, context, text, keyboard=keyboard)
+
 
 # --- HISTORY ---
 def get_history(address):
@@ -252,7 +288,7 @@ def get_history(address):
             
             # 1. Determine Direction
             is_sent = False
-            first_sender = inputs[0].get('sender', 'Unknown') if inputs else 'Unknown'
+            first_sender = inputs[0].get('sender_address', 'Unknown') if inputs else 'Unknown'
             
             if first_sender == address:
                 is_sent = True
@@ -265,9 +301,9 @@ def get_history(address):
                 # Standard logic: Sum of everything NOT going back to me.
                 recipients = []
                 for o in outputs:
-                    if o.get('receiver') != address:
+                    if o.get('receiver_address') != address:
                         amount_val += Decimal(o.get('value', 0))
-                        recipients.append(o.get('receiver', '?'))
+                        recipients.append(o.get('receiver_address', '?'))
                 
                 # If multiple recipients, show the first one or "Multiple"
                 if recipients:
@@ -278,7 +314,7 @@ def get_history(address):
             else:
                 # IN: Sum of outputs where receiver == address
                 for o in outputs:
-                    if o.get('receiver') == address:
+                    if o.get('receiver_address') == address:
                         amount_val += Decimal(o.get('value', 0))
                 # From: Sender
                 other_addr = first_sender
@@ -434,7 +470,7 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("💰 Refresh Balance", callback_data='refresh')],
         [InlineKeyboardButton("📥 Receive", callback_data='receive'), InlineKeyboardButton("📤 Send", callback_data='send_start')],
-        [InlineKeyboardButton("📜 History", callback_data='tx_page_0')]
+        [InlineKeyboardButton("📜 History", callback_data='tx_page_0'), InlineKeyboardButton("ℹ️ Info", callback_data='info')]
     ]
     
     # Use clean chat protocol
@@ -712,6 +748,7 @@ def main():
     app.add_handler(CallbackQueryHandler(receive_cb, pattern='^receive$'))
     app.add_handler(CallbackQueryHandler(back_dashboard_cb, pattern='^back_dashboard$'))
     app.add_handler(CallbackQueryHandler(history_cb, pattern='^tx_page_'))
+    app.add_handler(CallbackQueryHandler(info_cb, pattern='^info$'))
     app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern='^noop$'))
     
     conv_handler = ConversationHandler(
@@ -725,7 +762,7 @@ def main():
     )
     app.add_handler(conv_handler)
     
-    print("🤖 Bot is running (Clean Chat & English)...")
+    print("🤖 Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
