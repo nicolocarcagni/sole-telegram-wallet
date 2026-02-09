@@ -38,6 +38,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 NODE_URL = os.getenv("NODE_API_URL")
 SECRET_KEY = os.getenv("BOT_SECRET_KEY")
+FAUCET_PRIVATE_KEY = os.getenv("FAUCET_PRIVATE_KEY")
 
 USERS_FILE = "bot_users.json"
 COIN = 100_000_000
@@ -54,6 +55,9 @@ logger = logging.getLogger(__name__)
 if not TOKEN or not SECRET_KEY or not NODE_URL:
     logger.error("❌ MISSING CONFIGURATION! Please check .env file.")
     exit(1)
+
+if not FAUCET_PRIVATE_KEY:
+    logger.warning("⚠️ FAUCET_PRIVATE_KEY missing! Faucet feature will be disabled.")
 
 cipher_suite = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
 
@@ -231,6 +235,162 @@ def get_wallet(user_id):
     except Exception as e:
         logger.error(f"Decryption failed: {e}")
         return None
+
+# --- FAUCET LOGIC ---
+import random
+
+async def faucet_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not FAUCET_PRIVATE_KEY:
+        await query.answer("⚠️ Faucet is disabled by admin.", show_alert=True)
+        return
+
+    user_id = update.effective_user.id
+    db = load_db()
+
+    # 1. User check
+    if str(user_id) not in db:
+        await query.answer("⚠️ Create a wallet first!", show_alert=True)
+        return
+        
+    user_record = db[str(user_id)]
+    user_addr = user_record['address']
+
+    # 2. Rate Limit (24h)
+    last_claim = user_record.get('last_claim', 0)
+    current_time = int(time.time())
+    
+    # 24 hours = 86400 seconds
+    if current_time - last_claim < 86400:
+        remaining = 86400 - (current_time - last_claim)
+        hours = remaining // 3600
+        mins = (remaining % 3600) // 60
+        await send_new_screen(
+            update, context,
+            text=f"⏳ <b>Faucet Cooldown</b>\n\nYou must wait <b>{hours}h {mins}m</b> before requesting claim again.",
+            keyboard=[[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+        )
+        return
+
+    # 3. Amount (1.0 to 25.0 SOLE)
+    amount_sole = round(random.uniform(1.0, 25.0), 2)
+    amount_photons = int(amount_sole * COIN)
+
+    # 4. Faucet Wallet Setup
+    try:
+        faucet_sk_bytes =  bytes.fromhex(FAUCET_PRIVATE_KEY) if len(FAUCET_PRIVATE_KEY) == 64 else FAUCET_PRIVATE_KEY.encode()
+        # If raw bytes were passed as string? attempting hex decode is safest for keys usually
+        # The provided user context says "hex or raw string". Let's assume hex if 64 chars.
+        # Actually, let's try to handle potential formats more robustly if needed, 
+        # but standardized hex is best.
+        if len(FAUCET_PRIVATE_KEY) == 64:
+             try: faucet_sk_bytes = bytes.fromhex(FAUCET_PRIVATE_KEY)
+             except: faucet_sk_bytes = FAUCET_PRIVATE_KEY.encode() # Fallback
+        else:
+             faucet_sk_bytes = FAUCET_PRIVATE_KEY.encode() # Raw?
+
+        # Fix: ecdsa expects bytes.
+        
+        # Initializing wallet
+        # Note: If the key format is weird, SecureWallet might throw. 
+        # But we assume standard 32-byte hex or bytes.
+        
+        faucet_w = SecureWallet(faucet_sk_bytes)
+        faucet_addr = faucet_w.get_address()
+
+    except Exception as e:
+        logger.error(f"Faucet Key Error: {e}")
+        await send_new_screen(update, context, text="❌ <b>System Error</b>\nFaucet configuration invalid.")
+        return
+
+    # 5. Build Transaction (Admin -> User)
+    await send_new_screen(update, context, text="🔄 <b>Processing Faucet Claim...</b>\n\nFetching UTXOs and signing...")
+    
+    try:
+        # A. Fetch UTXOs
+        r = requests.get(f"{NODE_URL}/utxos/{faucet_addr}", timeout=5)
+        if r.status_code != 200:
+             raise Exception("Node offline or API error")
+        
+        utxos = r.json()
+        
+        # B. Select Inputs
+        acc = 0
+        inputs = []
+        for u in utxos:
+            acc += u['amount']
+            inputs.append({'txid': u['txid'], 'vout': u['vout'], 'amount': u['amount'], 'pubkey': faucet_w.pub_key_bytes, 'signature': b''})
+            if acc >= amount_photons: break
+            
+        if acc < amount_photons:
+            await send_new_screen(
+                update, context, 
+                text="❌ <b>Faucet Empty</b>\n\nThe faucet wallet is dry! Please contact admin.",
+                keyboard=[[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+            )
+            return
+
+        # C. Outputs
+        outputs = []
+        # Target
+        decoded_dest = base58_check_decode(user_addr)
+        outputs.append({'value': amount_photons, 'pubkeyhash': decoded_dest[1:]})
+        
+        # Change
+        if acc > amount_photons:
+            decoded_change = base58_check_decode(faucet_addr)
+            outputs.append({'value': acc - amount_photons, 'pubkeyhash': decoded_change[1:]})
+
+        # D. Sign
+        # Reuse logic from confirm_send mostly
+        now_ts = int(time.time())
+        for i, vin in enumerate(inputs):
+            sign_inputs = []
+            for j, v in enumerate(inputs):
+                row = {'txid': v['txid'], 'vout': v['vout'], 'signature': b''}
+                if i == j:
+                    sha_pub = hashlib.sha256(faucet_w.pub_key_bytes).digest()
+                    ripe_pub = ripemd160(sha_pub)
+                    row['pubkey'] = ripe_pub
+                else:
+                    row['pubkey'] = b''
+                sign_inputs.append(row)
+            
+            blob = serialize_for_hash(sign_inputs, outputs, now_ts)
+            tx_hash = hashlib.sha256(blob).digest()
+            vin['signature'] = faucet_w.sign(tx_hash)
+
+        # E. Broadcast
+        final_hex = serialize_for_api(inputs, outputs, now_ts).hex()
+        r = requests.post(f"{NODE_URL}/tx/send", json={"hex": final_hex})
+        
+        if r.status_code == 200:
+            txid = r.json().get('txid', '???')
+            
+            # Update DB check
+            db[str(user_id)]['last_claim'] = now_ts
+            save_db(db)
+            
+            msg = (
+                f"✅ <b>Faucet Claim Successful!</b>\n\n"
+                f"💰 <b>Received:</b> {amount_sole} SOLE\n"
+                f"🆔 <b>TXID:</b> <code>{txid}</code>\n\n"
+                f"<i>Come back in 24 hours for more!</i>"
+            )
+            kb = [[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+            await send_new_screen(update, context, text=msg, keyboard=kb)
+        else:
+            raise Exception(f"Node rejected: {r.text}")
+
+    except Exception as e:
+        logger.error(f"Faucet TX Failed: {e}")
+        await send_new_screen(
+            update, context, 
+            text=f"❌ <b>Claim Failed</b>\n\nError: {str(e)}",
+            keyboard=[[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+        )
 
 # --- BOT HANDLERS ---
 
@@ -470,7 +630,8 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("💰 Refresh Balance", callback_data='refresh')],
         [InlineKeyboardButton("📥 Receive", callback_data='receive'), InlineKeyboardButton("📤 Send", callback_data='send_start')],
-        [InlineKeyboardButton("📜 History", callback_data='tx_page_0'), InlineKeyboardButton("ℹ️ Info", callback_data='info')]
+        [InlineKeyboardButton("📜 History", callback_data='tx_page_0'), InlineKeyboardButton("🚰 Faucet", callback_data='faucet')],
+        [InlineKeyboardButton("ℹ️ Info", callback_data='info')]
     ]
     
     # Use clean chat protocol
@@ -748,6 +909,7 @@ def main():
     app.add_handler(CallbackQueryHandler(receive_cb, pattern='^receive$'))
     app.add_handler(CallbackQueryHandler(back_dashboard_cb, pattern='^back_dashboard$'))
     app.add_handler(CallbackQueryHandler(history_cb, pattern='^tx_page_'))
+    app.add_handler(CallbackQueryHandler(faucet_cb, pattern='^faucet$'))
     app.add_handler(CallbackQueryHandler(info_cb, pattern='^info$'))
     app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern='^noop$'))
     
