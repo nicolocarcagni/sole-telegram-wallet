@@ -138,6 +138,21 @@ def is_valid_address(address):
     except:
         return False
 
+# --- UI HELPERS ---
+def time_since(ts):
+    now = int(time.time())
+    diff = now - ts
+    if diff < 60: return "Just now"
+    if diff < 3600: return f"{diff//60}m ago"
+    if diff < 86400: return f"{diff//3600}h ago"
+    return f"{diff//86400}d ago"
+
+def render_progressbar(current, total, length=10):
+    percent = min(1.0, current / total)
+    filled_len = int(length * percent)
+    bar = "▓" * filled_len + "░" * (length - filled_len)
+    return bar
+
 # --- SERIALIZATION ---
 def serialize_for_hash(inputs, outputs, timestamp):
     buffer = bytearray()
@@ -183,7 +198,8 @@ class SecureWallet:
     def __init__(self, private_key_bytes):
         self.sk = ecdsa.SigningKey.from_string(private_key_bytes, curve=ecdsa.NIST256p)
         self.vk = self.sk.verifying_key
-        self.pub_key_bytes = self.vk.to_string()
+        # ANSI X9.62 Uncompressed: 0x04 + X + Y (65 bytes total for P-256)
+        self.pub_key_bytes = b'\x04' + self.vk.to_string()
 
     def get_address(self):
         sha_pub = hashlib.sha256(self.pub_key_bytes).digest()
@@ -263,14 +279,25 @@ async def faucet_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_time = int(time.time())
     
     # 24 hours = 86400 seconds
-    if current_time - last_claim < 86400:
-        remaining = 86400 - (current_time - last_claim)
+    elapsed = current_time - last_claim
+    if elapsed < 86400:
+        remaining = 86400 - elapsed
         hours = remaining // 3600
         mins = (remaining % 3600) // 60
+        
+        # Progress (Time Waited vs 24h)
+        # We want bar to show how much we WAITED (filled)
+        bar = render_progressbar(elapsed, 86400, length=12)
+        
         await send_new_screen(
             update, context,
-            text=f"⏳ <b>Faucet Cooldown</b>\n\nYou must wait <b>{hours}h {mins}m</b> before requesting claim again.",
-            keyboard=[[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+            text=(
+                f"⏳ <b>Faucet Cooldown</b>\n\n"
+                f"<code>[{bar}]</code>\n"
+                f"Wait <b>{hours}h {mins}m</b> more.\n\n"
+                f"<i>Give everyone a chance! 🌞</i>"
+            ),
+            keyboard=[[InlineKeyboardButton("🔙 Back", callback_data='back_dashboard')]]
         )
         return
 
@@ -427,7 +454,7 @@ async def info_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<i>Sole Blockchain is live since Jan 2026.</i>"
     )
     
-    keyboard = [[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_dashboard')]]
     await send_new_screen(update, context, text, keyboard=keyboard)
 
 
@@ -490,7 +517,10 @@ def get_history(address):
                 'direction': 'OUT' if is_sent else 'IN',
                 'amount': amount_val / Decimal(COIN),
                 'other': other_addr,
-                'date': date_str
+                'amount': amount_val / Decimal(COIN),
+                'other': other_addr,
+                'date': date_str,
+                'ts': ts # Keep raw timestamp for relative time
             })
             
         return parsed
@@ -540,15 +570,20 @@ async def history_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_lines = [f"📜 <b>Transaction History</b> (Page {page+1}/{total_pages})\n"]
     
     for item in page_items:
-        icon = "🔴" if item['direction'] == 'OUT' else "🟢"
+        icon = "📤" if item['direction'] == 'OUT' else "📥"
         sign = "-" if item['direction'] == 'OUT' else "+"
-        prepos = "to" if item['direction'] == 'OUT' else "from"
+        amt_fmt = f"{item['amount']:.2f}"
         
-        # FULL ADDRESS in code block, new line for redability
+        # Relative time
+        ago = time_since(item['ts'])
+        
+        # Format:
+        # 📤 -5.00 SOLE | 🕒 20m ago
+        # To: abc...
+        
         msg_lines.append(
-            f"{icon} <b>{sign}{item['amount']:.2f} SOLE</b> | {prepos}:\n"
+            f"{icon} <b>{sign}{amt_fmt} SOLE</b> | 🕒 {ago}\n"
             f"<code>{item['other']}</code>\n"
-            f"📅 {item['date']}\n"
         )
         
     text = "\n".join(msg_lines)
@@ -556,16 +591,16 @@ async def history_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Nav Buttons
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f'tx_page_{page-1}'))
+        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f'tx_page_{page-1}'))
     
-    nav_row.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data=f'noop'))
+    nav_row.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data=f'noop'))
     
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f'tx_page_{page+1}'))
+        nav_row.append(InlineKeyboardButton("➡️", callback_data=f'tx_page_{page+1}'))
         
     keyboard = [
         nav_row,
-        [InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]
+        [InlineKeyboardButton("🔙 Back", callback_data='back_dashboard')]
     ]
     
     # Try to edit the message to avoid spam
@@ -615,23 +650,23 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r = requests.get(f"{NODE_URL}/balance/{addr}", timeout=3)
         if r.status_code == 200:
              bal_float = Decimal(r.json().get('balance', 0)) / Decimal(COIN)
-             bal_text = f"{bal_float:.8f} SOLE"
+             bal_text = f"{bal_float:,.8f} SOLE"
         else:
-            bal_text = "Node Error"
+            bal_text = "⚠️ Node Error"
     except:
-        bal_text = "Node Offline"
+        bal_text = "🔌 Node Offline"
         
     text = (
-        f"📊 <b>Dashboard</b>\n\n"
-        f"💳 <b>Address:</b> <code>{addr}</code>\n"
+        f"🌞 <b>SOLE Wallet</b>\n\n"
+        f"💳 <b>Your Address:</b>\n<code>{addr}</code>\n\n"
         f"💰 <b>Balance:</b> {bal_text}"
     )
     
     keyboard = [
-        [InlineKeyboardButton("💰 Refresh Balance", callback_data='refresh')],
         [InlineKeyboardButton("📥 Receive", callback_data='receive'), InlineKeyboardButton("📤 Send", callback_data='send_start')],
-        [InlineKeyboardButton("📜 History", callback_data='tx_page_0'), InlineKeyboardButton("🚰 Faucet", callback_data='faucet')],
-        [InlineKeyboardButton("ℹ️ Info", callback_data='info')]
+        [InlineKeyboardButton("💰 Balance", callback_data='refresh'), InlineKeyboardButton("🚰 Faucet", callback_data='faucet')],
+        [InlineKeyboardButton("📜 History", callback_data='tx_page_0'), InlineKeyboardButton("ℹ️ Network", callback_data='info')],
+        [InlineKeyboardButton("🔄 Refresh", callback_data='refresh')]
     ]
     
     # Use clean chat protocol
@@ -647,21 +682,31 @@ async def receive_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     addr = db[str(user_id)]['address']
     
-    # QR
-    qr = qrcode.QRCode(box_size=10, border=4)
+    # QR with Styling
+    qr = qrcode.QRCode(box_size=10, border=2)
     qr.add_data(addr)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+    
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
+    
+    # Add Padding/Border for Dark Mode
+    border_size = 20
+    w, h = qr_img.size
+    new_w = w + (border_size * 2)
+    new_h = h + (border_size * 2)
+    
+    final_img = Image.new('RGB', (new_w, new_h), 'white')
+    final_img.paste(qr_img, (border_size, border_size))
+    
     bio = BytesIO()
-    img.save(bio, 'PNG')
+    final_img.save(bio, 'PNG')
     bio.seek(0)
     
-    keyboard = [[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_dashboard')]]
     
-    # Send Photo utilizing Clean Chat Protocol
     await send_new_screen(
         update, context, 
-        text=f"<code>{addr}</code>", 
+        text=f"📥 <b>Receive SOLE</b>\n\nAddress:\n<code>{addr}</code>", 
         photo=bio,
         keyboard=keyboard
     )
@@ -678,7 +723,11 @@ async def send_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='cancel_wizard')]]
     await send_new_screen(
         update, context,
-        text="📤 <b>Send SOLE</b>\n\n1️⃣ Please paste the recipient's address:",
+        text=(
+            "📤 <b>Send SOLE</b>\n\n"
+            "1️⃣ <b>Recipient Address</b>\n"
+            "Please paste the address or send a QR code image."
+        ),
         keyboard=keyboard
     )
     return ASK_ADDR
@@ -766,7 +815,7 @@ async def ask_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         await send_new_screen(
             update, context,
-            text=f"{extra_text}✅ Address valid.\n\n2️⃣ Enter the amount to send (e.g. 10.5):",
+            text=f"{extra_text}✅ Address accepted.\n\n2️⃣ <b>Amount</b>\nEnter the amount to send (e.g. 5.5):",
             keyboard=keyboard
         )
         return ASK_AMOUNT
@@ -793,7 +842,7 @@ async def ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 <b>Transaction Summary</b>\n\n"
             f"➡️ <b>To:</b> <code>{context.user_data['to_addr']}</code>\n"
             f"💰 <b>Amount:</b> {amount_sole} SOLE\n\n"
-            "Confirm sending?"
+            "3️⃣ <b>Confirm?</b>"
         )
         kb_confirm = [
             [InlineKeyboardButton("✅ Confirm", callback_data='confirm_yes'), InlineKeyboardButton("❌ Cancel", callback_data='cancel_wizard')]
@@ -844,7 +893,7 @@ async def confirm_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if acc >= amount_photons: break
         
     if acc < amount_photons:
-        kb = [[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data='back_dashboard')]]
         await send_new_screen(update, context, text=f"❌ <b>Insufficient Funds</b>\n\nYou have {Decimal(acc)/Decimal(COIN)} SOLE.", keyboard=kb)
         return ConversationHandler.END
         
@@ -881,15 +930,16 @@ async def confirm_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if r.status_code == 200:
             txid = r.json().get('txid', '???')
-            kb = [[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
+            kb = [[InlineKeyboardButton("🔙 Back", callback_data='back_dashboard')]]
             await send_new_screen(update, context, text=f"✅ <b>Transaction Sent!</b>\n\nTXID: <code>{txid}</code>", keyboard=kb)
         else:
-             kb = [[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
-             await send_new_screen(update, context, text=f"❌ <b>Node Error</b>\n{r.text}", keyboard=kb)
+             kb = [[InlineKeyboardButton("🔙 Back", callback_data='back_dashboard')]]
+             await send_new_screen(update, context, text=f"❌ <b>Node Rejected</b>\n{r.text}", keyboard=kb)
 
     except Exception as e:
-         kb = [[InlineKeyboardButton("🔙 Back to Dashboard", callback_data='back_dashboard')]]
-         await send_new_screen(update, context, text=f"❌ <b>Error</b>\n{e}", keyboard=kb)
+         logger.error(f"Send TX Failed: {e}")
+         kb = [[InlineKeyboardButton("🔙 Back", callback_data='back_dashboard')]]
+         await send_new_screen(update, context, text=f"❌ <b>Transaction Failed</b>\n\nAn error occurred while processing your transaction. Please try again.", keyboard=kb)
          
     return ConversationHandler.END
 
